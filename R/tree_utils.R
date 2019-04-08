@@ -19,20 +19,20 @@
 #' @importFrom methods is
 #'
 #' @export
-PruneTreeGamma <- function(x, gamma = seq(0, 3, length.out = 50)) {
+PruneTreeGamma <- function(x, value = seq(0, 3, length.out = 50), name = 'max_gain') {
   stopifnot(is(x, "bs_tree"))
 
   cpts <- list()
   pruned_tree <- list()
-  for (i in seq_along(gamma)) {
-    FUN <- PenalizeSplitsFUN(gamma[i])
+  for (v in value) {
+    FUN <- PenalizeSplitsFUN(value = v, name = name)
 
     clone_tree <- data.tree::Clone(x, pruneFun = FUN) # TODO: Check if copy can be avoided
 
-    cpts[[i]] <- GetChangePointsFromLeafs(clone_tree)
-    pruned_tree[[i]] <- clone_tree
+    cpts[[as.character(v)]] <- GetChangePointsFromLeafs(clone_tree)
+    pruned_tree[[as.character(v)]] <- clone_tree
   }
-  list(cpts = cpts, gamma = gamma, pruned_tree = pruned_tree)
+  list(cpts = cpts, value = value, pruned_tree = pruned_tree)
 }
 
 #' GetChangePointsFromLeafs
@@ -43,6 +43,7 @@ PruneTreeGamma <- function(x, gamma = seq(0, 3, length.out = 50)) {
 #'
 #' @param x An object of class \strong{bs_tree}
 #'
+#' @export
 #' @return A vector with the sorted changepoints.
 GetChangePointsFromLeafs <- function(x) {
   stopifnot(is(x, "bs_tree"))
@@ -66,14 +67,14 @@ GetChangePointsFromLeafs <- function(x) {
 #' @param gamma Split penality
 #'
 #' @return FALSE if the node should be pruned from tree
-PenalizeSplitsFUN <- function(gamma) {
+PenalizeSplitsFUN <- function(value, name = 'max_gain') {
   function(node) {
     node <- data.tree::Navigate(node, "..") # We want to prune the parent tree where the split would've occured
 
-    if (is.null(node$min_loss) || is.null(node$segment_loss)) {
+    if (is.null(node[[name]])) {
       TRUE
     } else {
-      node$min_loss + gamma < node$segment_loss
+      node[[name]] - value > 0
     }
   }
 }
@@ -89,5 +90,5 @@ PenalizeSplitsFUN <- function(gamma) {
 #'
 #' @export
 print.bs_tree <- function(x, ...) {
-  NextMethod(generic = NULL, object = NULL, "start", "end", "min_loss", "segment_loss", ...)
+  NextMethod(generic = NULL, object = NULL, "start", "end", "max_gain", "cv_train_loss", "cv_train_improvement", "cv_train_improvement_sd", "cv_lambda_opt", "cv_test_loss", "cv_test_improvement",  ...)
 }

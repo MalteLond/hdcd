@@ -27,14 +27,16 @@
 #' CrossValidation(dat, method = "summed_regression")
 #' }
 CrossValidation <- function(x,
-                            delta = c(0.1, 0.25),
+                            delta = NULL,
                             lambda = NULL,
                             lambda_min_ratio = 0.01,
                             lambda_grid_size = 10,
                             gamma = NULL,
                             n_folds = 10,
-                            method = c("nodewise_regression", "summed_regression", "ratio_regression"),
+                            method = c("nodewise_regression", "summed_regression", "ratio_regression", 'glasso', 'elastic_net'),
+                            NA_method = c('complete_observations', 'pairwise_covariance_estimation', 'loh_wainwright_bias_correction'),
                             penalize_diagonal = F,
+                            alpha = 1,
                             optimizer = c("line_search", "section_search"),
                             control = NULL,
                             standardize = T,
@@ -42,21 +44,11 @@ CrossValidation <- function(x,
                             parallel = T,
                             verbose = T,
                             FUN = NULL,
+                            cv.FUN = NULL,
                             ...) {
+
   n_obs <- NROW(x)
   n_p <- NCOL(x)
-
-  if (is.null(FUN)) {
-    SegmentLossFUN <- SegmentLoss(
-      n_obs = NROW(x), lambda = lambda, penalize_diagonal = penalize_diagonal,
-      method = method, standardize = standardize, threshold = threshold, ...
-    )
-  } else {
-    stopifnot(c("x") %in% methods::formalArgs(FUN))
-    SegmentLossFUN <- FUN(x)
-    stopifnot(c("x", "start", "end") %in% methods::formalArgs(SegmentLossFUN))
-  }
-
 
   # necessary because parser won't allow 'foreach' directly after a foreach object
   if (foreach::getDoParWorkers() == 1 && parallel) {
@@ -70,12 +62,10 @@ CrossValidation <- function(x,
   `%:%` <- foreach::`%:%`
 
   # choose lambda as grid around the asymptotic value
-  if (is.null(lambda) && is.null(FUN) && NCOL(x) > 1) {
-    cov_mat <- cov(x)
+  if (is.null(lambda) && NCOL(x) > 1) {
+    cov_mat <- get_cov_mat(x, NA_method)$mat
     lambda_max <- max(abs(cov_mat[upper.tri(cov_mat)]))
     lambda <- LogSpace(lambda_min_ratio * lambda_max, lambda_max, length.out = lambda_grid_size)
-  } else if (!is.null(FUN)) {
-    lambda <- c(1, 2)
   }
 
   n_lambdas <- length(lambda)
@@ -87,22 +77,24 @@ CrossValidation <- function(x,
   n_delta <- length(delta)
 
   if (verbose) cat("\n")
+  # for (lam in lambda){
+  #   for (del in delta){
+  #     for (fold in seq_len(n_folds)){
   cv_results <- foreach::foreach(fold = seq_len(n_folds), .inorder = F, .packages = "hdcd", .verbose = F) %:%
     foreach::foreach(del = delta, .inorder = T) %:%
     foreach::foreach(lam = lambda, .inorder = T) %hdcd_do% {
       test_inds <- seq(fold, n_obs, n_folds)
       train_inds <- setdiff(1:n_obs, test_inds)
-      n_g <- length(test_inds)
 
       tree <- BinarySegmentation(
         x = x[train_inds, , drop = F], delta = del, lambda = lam,
-        method = method, penalize_diagonal = penalize_diagonal,
+        method = method, NA_method = NA_method, penalize_diagonal = penalize_diagonal,
         optimizer = optimizer, control = control, threshold = threshold,
         standardize = standardize, FUN = FUN, ...
       )
 
       if (is.null(gamma)) {
-        final_gamma <- c(0, sort(tree$Get("segment_loss") - tree$Get("min_loss")))
+        final_gamma <- c(0, sort(tree$Get("max_gain")))
         final_gamma <- final_gamma[which(final_gamma >= 0)]
       } else {
         final_gamma <- gamma
@@ -111,53 +103,37 @@ CrossValidation <- function(x,
       res <- PruneTreeGamma(tree, final_gamma)
       rm(tree)
       loss_gamma <- numeric(length(final_gamma))
-      n_params_gamma <- numeric(length(final_gamma))
       cpts <- list()
+
       for (gam in seq_along(final_gamma)) {
-        fit <- FullRegression(
-          x[train_inds, , drop = F],
-          cpts = res$cpts[[gam]], # TODO: Can we somehow cache the fits from before instead of refitting the model? Should be the endpoints of the pruned tree!
-          lambda = lam, standardize = standardize, threshold = threshold
-        )
-
-        segment_bounds <- c(1, train_inds[res$cpts[[gam]]], n_obs) # transform cpts back to original indices
-
         loss <- 0
-        n_params <- 0
+        alpha <- c(1, train_inds[res$cpts[[gam]]], n_obs + 1) # transform cpts back to original indices
+        for (i in 1:(length(alpha) - 1)){
 
-        for (seg in seq_len(length(segment_bounds) - 1)) {
-          seg_test_inds <- test_inds[which(test_inds >= segment_bounds[seg] & test_inds < segment_bounds[seg + 1])]
+          train_range <- intersect(train_inds, alpha[i] : (alpha[i + 1] - 1))
+          test_range <- intersect(test_inds, alpha[i] : (alpha[i + 1] - 1))
 
-          if (length(seg_test_inds) == 0) {
-            warning("Segment had no test data. Consider reducing the number of folds.")
-            next
-          }
-
-          wi <- fit$est_coefs[[seg]]
-          intercepts <- fit$est_intercepts[[seg]]
-
-          # TODO: Instead of calculating the RSS, we could take the likelihood ratio here again, can we store the loss for one segment per
-          #  dimension before and reuse it here?
-
-          if (n_p > 1) {
-            loss <- loss +
-              sum(sapply(1:n_p, function(z) RSS(x[seg_test_inds, -z, drop = F], x[seg_test_inds, z, drop = F], wi[-z, z, drop = F], intercepts[z]))) / n_obs
-            n_params <- n_params + length(which(wi[upper.tri(wi)] != 0))
+          if (length(test_range) == 0){
+            warning("Segment has no test data. Consider reducing the number of folds.")
           } else {
-            loss <- loss + RSS(x[seg_test_inds, , drop = F], x[seg_test_inds, , drop = F], wi, intercepts) / n_obs
+            loss <- loss + CrossValidationLoss(x_train = x[train_range, , drop = F], x_test = x[test_range, , drop = F], n_obs_train = length(train_inds),
+                                   lambda = lam, penalize_diagonal = penalize_diagonal, threshold = threshold,
+                                   method = method, NA_method = NA_method)
           }
         }
 
-        n_params <- n_params + (length(segment_bounds) - 1) * n_p # Add mean params to count
-
-        loss_gamma[gam] <- loss / n_g
-        n_params_gamma[gam] <- n_params
-        cpts[[gam]] <- segment_bounds
+        loss_gamma[gam] <- loss / length(test_inds)
+        cpts[[gam]] <- train_inds[res$cpts[[gam]]]
+        if(verbose) cat(paste('Changepoints corresponding to Gamma = ', final_gamma[gam], ' are ', paste(cpts[[gam]], collapse = ', '), 'corresponding to loss = ', loss, '\n'))
       }
       rm(res)
       if (verbose) cat(paste(Sys.time(), "  FINISHED fit -  Fold: ", fold, " Lambda: ", round(lam, 3), " Delta: ", round(del, 3), " \n"))
-      list(fold = fold, lambda = lam, delta = del, gamma = final_gamma, loss = loss_gamma, cpts = cpts, n_params = n_params_gamma)
-    }
+
+
+      list(fold = fold, lambda = lam, delta = del, gamma = final_gamma, loss = loss_gamma, cpts = cpts)
+    #   }
+    # }
+  }
 
   res <- data.frame()
   for (fold in seq_len(n_folds)) {
@@ -169,8 +145,7 @@ CrossValidation <- function(x,
           lambda = r[["lambda"]],
           delta = r[["delta"]],
           gamma = r[["gamma"]],
-          loss = r[["loss"]],
-          n_params = r[["n_params"]]
+          loss = r[["loss"]]
         )
         # Need to assign those separately since it is a list
         new_res$cpts <- r[["cpts"]]
@@ -187,6 +162,87 @@ CrossValidation <- function(x,
 
   list(opt = opt[which.min(opt$loss), , drop = TRUE], cv_results = results)
 }
+
+#'
+#'
+#'
+#
+cv_hdcd <- function(x, y = NULL, method = "glasso", NA_method = "complete_observations",
+                    optimizer = "line_search", delta = NULL, lambda = NULL, gamma = NULL, control = NULL){
+
+  # parse values NA_method, method and optimizer
+  mth <- match.arg(method, c("glasso", "nodewise_regression", "summed_regression", "ratio_regression", "elastic_net"))
+  NA_mth <- match.arg(NA_method, c("complete_observations", "average_imputation", "loh_wainwright_bias_correction", "pairwise_covariance_estimation"))
+  opt <- match.arg(optimizer, c("line_search", "section_search"))
+
+  n <- nrow(x)
+
+  # read parameters from control
+  n_folds_outer <- control_get(control, "n_folds_outer", 5)
+  randomize_outer_folds <- control_get(control, "randomize_outer_folds", FALSE)
+  verbose <- control_get(control, "verbose", TRUE)
+
+  # Series of checks to ensure functionality in special cases and return warnings
+  if(!is.matrix(x)){
+    x <- as.matrix(x)
+    warning("Input data x has been coerced to matrix by hdcd.")
+  }
+  if(!is.null(y) & method != "elastic_net"){
+    warning("Input y is ignored since method is not elastic_net")
+  }
+  # if (!is.null(node) & method != "nodewise_regression") {
+  #   warning("Input node is ignored since method is not nodewise_regression")
+  # }
+  # if (!is.null(alpha) & method != "elastic_net"){
+  #   warning("Input alpha is ignored since method is not elastic_net")
+  # }
+  if (NA_method == "complete_observations" & mean(complete.cases(x)) < 0.5){
+    warning("Less than 50% of observations are complete. Consider using a different NA_method")
+  }
+
+  if (!is.null(y) & method == "elastic_net"){
+    x <- cbind(y,x)
+  }
+
+  # choose lambda as grid around the asymptotic value if no specific value is supplied
+  if (is.null(lambda) && NCOL(x) > 1) {
+    cov_mat <- get_cov_mat(x, NA_method)$mat
+    lambda_max <- max(abs(cov_mat[upper.tri(cov_mat)]))
+    lambda <- LogSpace(0.01 * lambda_max, lambda_max, length.out = 10)
+    if (verbose) cat("Values for lambda chosen by asymptotic theory are", round(lambda, 3), "\n", sep = " ")
+  }
+
+  # choose three sensible values for delta if no specific value is supplied
+  if (is.null(delta)) {
+    delta <- c(0.05, 0.1, 0.2)
+    if (verbose) cat("Values for delta chosen are", delta, "\n", sep = " ")
+  }
+
+  folds_outer <- sample_folds(n, n_folds_outer, randomize_outer_folds)
+
+  # set up data.table to save results in
+  cv_results <- data.table::data.table()
+
+  # do outer cross validation
+  for (outer in 1:n_folds_outer){
+    for (lam in lambda){
+      for (del in delta){
+
+        if (verbose) cat(c(outer, lam), "\n", sep = "") # only for test purposes
+        test_inds <- cumsum(folds_outer == outer)
+        test_inds <- c(test_inds[folds_outer != outer], test_inds[n])
+
+        tree <- BinarySegmentation(x[folds_outer != outer, , drop = F],
+                                   x_test = x[folds_outer == outer, ], test_inds = test_inds,
+                                   method = mth,
+                                   NA_method = NA_mth, optimizer = opt, delta = del, lambda = lam,
+                                   gamma = gamma, control = control)
+        if (verbose) cat("fit finished. \n")
+        print(tree)
+      }}}
+  tree
+  }
+
 
 
 #' plot.bs_cv
@@ -214,7 +270,6 @@ plot.bs_cv <- function(x, ..., show_legend = T) {
             lambda = formatC(x[["lambda"]], format = "e", digits = 2),
             gamma = x[["loss"]][, 1],
             loss = rowMeans(x[["loss"]][, -1]),
-            n_params = rowMeans(x[["n_params"]][, -1]),
             n_cpts = 0
           )
         } else {
@@ -223,17 +278,15 @@ plot.bs_cv <- function(x, ..., show_legend = T) {
             lambda = formatC(x[["lambda"]], format = "e", digits = 2),
             gamma = x[["loss"]][, 1],
             loss = rowMeans(x[["loss"]][, -1]),
-            n_params = rowMeans(x[["n_params"]][, -1]),
             n_cpts = rowMeans(apply(x[["cpts"]][, -1, drop = F], 2, function(x) sapply(x, length) - 2))
           )
         }
     )
   ) # substract first and last segment boundary
 
-  res_long <- reshape2::melt(res_long, measure.vars = c("loss", "n_cpts", "n_params"), value.name = "value", variable.name = "metric")
+  res_long <- reshape2::melt(res_long, measure.vars = c("loss", "n_cpts"), value.name = "value", variable.name = "metric")
 
   metrics_names <- c(
-    "n_params" = "# of parameters",
     "loss" = "cv-loss",
     "n_cpts" = "# of changepoints"
   )
@@ -274,12 +327,11 @@ plot.bs_cv <- function(x, ..., show_legend = T) {
 }
 
 
-SolutionPaths <- function(dat) {
+SolutionPaths <- function(dat, var = "loss") {
   dat <- dat[order(dat$gamma), ]
   list(
     lambda = dat$lambda[1], delta = dat$delta[1],
-    loss = ImputeMatrix(reshape2::dcast(dat, gamma ~ fold, value.var = "loss")),
-    n_params = ImputeMatrix(reshape2::dcast(dat, gamma ~ fold, value.var = "n_params")),
+    loss = ImputeMatrix(reshape2::dcast(dat, gamma ~ fold, value.var = var)),
     cpts = ImputeMatrix(reshape2::dcast(dat, gamma ~ fold, value.var = "cpts", fill = NA))
   )
 }
@@ -315,4 +367,14 @@ GetOpt <- function(param_res) {
 
 LogSpace <- function(from, to, length.out) {
   exp(seq(log(from), log(to), length.out = length.out))
+}
+
+sample_folds <- function(n, k, randomize = TRUE){
+  if (randomize){
+    random_draw <- runif(n)
+    k_quantiles <- quantile(random_draw, 0:k/k)
+    cut(random_draw, k_quantiles, labels = 1:k, include.lowest = TRUE)
+  } else {
+    as.factor(rep(1:k, ceiling(n/k))[1:n])
+  }
 }

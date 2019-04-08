@@ -31,73 +31,73 @@
 #' hdcd(dat, 0.1, 0.1, 0.05, method = "summed_regression", verbose = T)
 #' }
 hdcd <- function(x,
-                 delta = 0.1,
                  lambda = NULL,
-                 lambda_min_ratio = 0.01,
-                 lambda_grid_size = 10,
-                 gamma = NULL,
-                 method = c("nodewise_regression", "summed_regression", "ratio_regression"),
-                 penalize_diagonal = F,
+                 test_inds = NULL,
+                 y= NULL,
+                 delta = 0.1,
+                 gamma = 0,
+                 method = c('glasso', "nodewise_regression", "summed_regression", "ratio_regression", 'elastic_net'),
+                 NA_method = 'complete_observations',
                  optimizer = c("line_search", "section_search"),
-                 control = NULL,
-                 standardize = T,
-                 threshold = 1e-7,
-                 n_folds = 10,
-                 verbose = T,
-                 parallel = T,
                  FUN = NULL,
+                 control = hdcd_control(),
                  ...) {
-  stopifnot(nrow(x) > 1)
-  x_mat <- as.matrix(x)
-  cv <- FALSE
 
-  if ((is.null(lambda) || is.null(gamma) || is.null(delta)) | length(c(gamma, lambda, delta)) > 3) {
-    cv <- TRUE
-    if (verbose) cat("\nPerforming ", n_folds, "- fold cross-validation...\n")
-    cv_res <- CrossValidation(
-      x = x_mat, delta = delta, method = method, lambda = lambda,
-      lambda_min_ratio = lambda_min_ratio, lambda_grid_size = lambda_grid_size,
-      gamma = gamma, n_folds = n_folds,
-      optimizer = optimizer,
-      control = control,
-      standardize = standardize,
-      penalize_diagonal = penalize_diagonal,
-      verbose = verbose,
-      parallel = parallel,
-      threshold = threshold,
-      FUN = FUN,
-      ...
-    )
-    lambda <- cv_res$opt$lambda
-    gamma <- cv_res$opt$gamma
-    delta <- cv_res$opt$delta
+  verbose <- control$verbose
+
+  if(!is.matrix(x)){
+    x <- as.matrix(x)
+    warning("Input data x has been coerced to matrix by hdcd.")
   }
+  stopifnot(nrow(x) > 1)
+
+  # If y is supplied, it is bound to x
+  if(!is.null(y)){
+    stopifnot(nrow(x) == length(y))
+    x <- cbind(y, x)
+  }
+
+  if(is.null(control$cv_inner_lambda) & control$cv_inner & !(control$cv_inner_search_lambda)){
+    # choose lambda as grid around the asymptotic value
+    cov_mat <- get_cov_mat(x, NA_method)$mat
+    lambda_max <- max(abs(cov_mat[upper.tri(cov_mat)]))
+    control$cv_inner_lambda <- LogSpace(control$cv_inner_min_grid_ratio * lambda_max,
+                                        lambda_max,
+                                        length.out = control$cv_inner_n_lambda)
+    if (verbose) cat('lambda for inner cv is set by asymptotic theory to ',
+                     paste(control$cv_inner_lambda, collapse = ', '), '\n')
+  }
+
+  # If a individual loss function is supplied, check that it has the required form
+
+  if(!is.null(FUN) ){
+    stopifnot('x' %in% methods::formalArgs(FUN))
+  }
+
+  # NA_mth <- match.arg(NA_method)
+  # if(NA_mth == 'complete_observations'){
+  #   cases <- complete.cases(x)
+  #   x <- x[cases, ]
+  #   if (any(!cases)){
+  #     warning(paste('There are', sum(!cases), 'incomplete cases in x that are discarded. Maybe choose another NA_method', sep = ' '))
+  #   }
+  #   train_inds <- which(cases)
+  # } else {
+  #   train_inds <- 1 : nrow(x)
+  # }
 
   tree <- BinarySegmentation(
-    x = x_mat, delta = delta, lambda = lambda, method = method,
-    threshold = threshold, penalize_diagonal = penalize_diagonal,
-    optimizer = optimizer, control = control, standardize = standardize,
-    FUN = FUN,
+    x = x, test_inds = test_inds, delta = delta, lambda = lambda, method = method, NA_method = NA_method,
+    optimizer = optimizer, control = control, FUN = FUN,
     ...
   )
-  res <- PruneTreeGamma(tree, gamma)
-  if (verbose) {
-    cat("\nFinal tree for cross-validated gamma and lambda:\n \n")
-    print(res[["pruned_tree"]])
-  }
 
-  if (cv) {
-    res <- list(
-      changepoints = res[["cpts"]][[1]], cv_results = cv_res[["cv_results"]],
-      cv_gamma = gamma, cv_lambda = lambda, cv_delta = delta
-    )
-    class(res) <- "bs_cv"
-  } else {
-    res <- list(changepoints = res[["cpts"]][[1]], tree = tree)
-    class(res) <- "bs"
-  }
-  res
+  tree
 }
+
+
+
+
 
 #' Print method for objects of class bs_cv
 #'
